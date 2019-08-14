@@ -9,7 +9,8 @@ import sys
 
 # Utilities
 def kdl_frame_to_msg_pose(kdl_pose):
-    p = Pose()
+    ps = PoseStamped()
+    p = ps.pose
     p.position.x = kdl_pose.p[0]
     p.position.y = kdl_pose.p[1]
     p.position.z = kdl_pose.p[2]
@@ -19,19 +20,19 @@ def kdl_frame_to_msg_pose(kdl_pose):
     p.orientation.z = kdl_pose.M.GetQuaternion()[2]
     p.orientation.w = kdl_pose.M.GetQuaternion()[3]
 
-    return p
+    return ps
 
 
 def msg_pose_to_kdl_frame(msg_pose):
+    pose = msg_pose.pose
     f = Frame()
-    f.p.x = msg_pose.position.x
-    f.p.y = msg_pose.position.y
-    f.p.z = msg_pose.position.z
-
-    f.M.Quaternion(msg_pose.orientation.x,
-                   msg_pose.orientation.y,
-                   msg_pose.orientation.z,
-                   msg_pose.orientation.w)
+    f.p[0] = pose.position.x
+    f.p[1] = pose.position.y
+    f.p[2] = pose.position.z
+    f.M = Rotation.Quaternion(pose.orientation.x,
+                              pose.orientation.y,
+                              pose.orientation.z,
+                              pose.orientation.w)
 
     return f
 
@@ -55,8 +56,8 @@ class ProxyMTM:
         pass
 
         self.pose = Frame()
-        self.pose.p(0, 0, 0)
-        self.pose.M.Quaternion(0, 0, 0, 1)
+        self.pose.p = Vector(0, 0, 0)
+        self.pose.M = Rotation.Quaternion(0, 0, 0, 1)
         self.buttons = 0
 
         self._commanded_force = Vector(0, 0, 0)
@@ -64,9 +65,10 @@ class ProxyMTM:
         self._gripper_min_angle = -3.16
         self._gripper_max_angle = 1.2
         self._gripper_angle = JointState()
+        self._gripper_angle.position.append(0)
 
-        self._pose_pub = rospy.Publisher(pose_str, PoseStamped)
-        self._gripper_pub = rospy.Publisher(gripper_str, JointState)
+        self._pose_pub = rospy.Publisher(pose_str, PoseStamped, queue_size=1)
+        self._gripper_pub = rospy.Publisher(gripper_str, JointState, queue_size=1)
 
         self._force_sub = rospy.Subscriber(wrench_str, WrenchStamped, self.force_cb, queue_size=10)
 
@@ -110,12 +112,12 @@ class ProxyButtons:
         cam_str = base_str + 'cam'
 
         self._clutch = Joy()
-        self._clutch.buttons[0] = 0
+        self._clutch.buttons.append(0)
         self._cam = Joy()
-        self._cam.buttons[0] = 0
+        self._cam.buttons.append(0)
 
-        self._clutch_pub = rospy.Publisher(clutch_str, Joy)
-        self._cam_pub = rospy.Publisher(cam_str, Joy)
+        self._clutch_pub = rospy.Publisher(clutch_str, Joy, queue_size=1)
+        self._cam_pub = rospy.Publisher(cam_str, Joy, queue_size=1)
         pass
 
     def set_clutch_footpedals(self, btn):
@@ -150,17 +152,20 @@ class GeomagicDevice:
         self.tip_frame = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
         self.grey_button_pressed = False
         self.white_button_pressed = False
-        self._force = Vector(0, 0, 0)
+        self._force = DeviceFeedback()
+        self._force.force.x = 0
+        self._force.force.y = 0
+        self._force.force.z = 0
 
         self._pose_sub = rospy.Subscriber(pose_str, PoseStamped, self.pose_cb, queue_size=10)
         self._button_sub = rospy.Subscriber(button_str, DeviceButtonEvent, self.buttons_cb, queue_size=10)
-        self._force_pub = rospy.Publisher(force_str, DeviceFeedback)
+        self._force_pub = rospy.Publisher(force_str, DeviceFeedback, queue_size=1)
 
         self._mtm_handle = ProxyMTM(mtm_name)
 
     def pose_cb(self, msg):
 
-        cur_frame = msg_pose_to_kdl_frame(msg.pose)
+        cur_frame = msg_pose_to_kdl_frame(msg)
         # Convert the position based on the scale
         cur_frame.p = cur_frame.p * self._scale
 
@@ -172,27 +177,34 @@ class GeomagicDevice:
     def buttons_cb(self, msg):
         self.grey_button_pressed = msg.grey_button
         self.white_button_pressed = msg.white_button
-
-        self._mtm_handle.set_foot_pedal(self.grey_button_pressed)
-        self._mtm_handle.set_gripper_angle(self.white_button_pressed)
         pass
 
     def command_force(self, force):
         pass
 
     def process_commands(self):
-        self._mtm_handle.set_pose(self.pose)
+        if self._active:
+            self._mtm_handle.set_pose(self.pose)
+            self._mtm_handle.set_gripper_angle(self.white_button_pressed)
+            self._mtm_handle.set_foot_pedal(self.grey_button_pressed)
 
-        self._force = self._mtm_handle.ge
+            force = self._mtm_handle.get_commanded_force()
+            force = self.base_frame.M.Inverse() * force
+            self._force.force.x = force[0]
+            self._force.force.y = force[1]
+            self._force.force.z = force[2]
+            # self._force_pub.publish(self._force)
 
 
 def main():
-    _pair_one_specified = False
+    _pair_one_specified = True
     _pair_two_specified = False
     rospy.init_node('geomagic_mtm_proxy_node')
 
     _geomagic_one_name = '/Geomagic/'
     _geomagic_two_name = '/Geomagic/'
+
+    _device_pairs = []
 
     _mtm_one_name = 'MTMR'
     _mtm_two_name = 'MTML'
@@ -202,24 +214,28 @@ def main():
 
     if len(sys.argv) > 2:
         _mtm_one_name = sys.argv[2]
-        _pair_one_specified = True
-
-    if len(sys.argv) > 1:
-        _geomagic_two_name = sys.argv[3]
-
-    if len(sys.argv) > 1:
-        _mtm_two_name = sys.argv[4]
-        _pair_two_specified = True
-
-    else:
-        print("No ARMS specified")
-        exit()
+        _geomagic_two_name = True
 
     if _pair_one_specified:
         geomagic_one = GeomagicDevice(_geomagic_one_name, _mtm_one_name)
+        _device_pairs.append(geomagic_one)
 
     if _pair_two_specified:
         geomagic_two = GeomagicDevice(_geomagic_two_name, _mtm_two_name)
+        _device_pairs.append(geomagic_two)
+
+    rate = rospy.Rate(500)
+    msg_index = 0
+
+    while not rospy.is_shutdown():
+        for dev in _device_pairs:
+            dev.process_commands()
+        rate.sleep()
+        msg_index = msg_index + 1
+        if msg_index % 500 == 0:
+            print('MTM MIMIC VIA GEOMAGIC ACTIVE...')
+        if msg_index >= 5000:
+            msg_index = 0
 
 
 if __name__ == "__main__":
