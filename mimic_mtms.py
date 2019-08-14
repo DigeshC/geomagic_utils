@@ -2,10 +2,9 @@ import rospy
 from std_msgs.msg import Empty
 from geometry_msgs.msg import PoseStamped, Pose, WrenchStamped, Wrench
 from sensor_msgs.msg import Joy, JointState
-from geomagic_control.msg import DeviceButtonEvent, DeviceFeedback
+from geomagic_control.msg import DeviceFeedback, DeviceButtonEvent
 from PyKDL import Frame, Vector, Rotation
 import sys
-
 
 # Utilities
 def kdl_frame_to_msg_pose(kdl_pose):
@@ -45,7 +44,6 @@ class ProxyMTM:
         gripper_str = '/dvrk/' + arm_name + '/state_gripper_current'
         status_str = '/dvrk/' + arm_name + '/status'
 
-
         self._mtm_arm_type = None
 
         if arm_name == 'MTMR':
@@ -53,6 +51,7 @@ class ProxyMTM:
         elif arm_name == 'MTML':
             self._mtm_arm_type = 1
         else:
+            print('SPECIFIED ARM: ', arm_name)
             print('WARNING, MTM ARM TYPE NOT UNDERSTOOD, SHOULD BE MTMR or MTML')
         pass
 
@@ -161,12 +160,17 @@ class GeomagicDevice:
         self._force.force.x = 0
         self._force.force.y = 0
         self._force.force.z = 0
+        self._force.position.x = 0
+        self._force.position.y = 0
+        self._force.position.z = 0
 
         self._pose_sub = rospy.Subscriber(pose_str, PoseStamped, self.pose_cb, queue_size=10)
         self._button_sub = rospy.Subscriber(button_str, DeviceButtonEvent, self.buttons_cb, queue_size=10)
         self._force_pub = rospy.Publisher(force_str, DeviceFeedback, queue_size=1)
 
+        print('BINDING GEOMAGIC DEVICE: ', name, 'TO MOCK MTM DEVICE: ', mtm_name)
         self._mtm_handle = ProxyMTM(mtm_name)
+        self._msg_counter = 0
 
     def set_base_frame(self, frame):
         self.base_frame = frame
@@ -211,7 +215,16 @@ class GeomagicDevice:
             self._force.force.x = force[0]
             self._force.force.y = force[1]
             self._force.force.z = force[2]
+
+            if self._msg_counter % 500 == 0:
+                # print (self._force)
+                pass
+            if self._msg_counter >= 1000:
+                self._msg_counter = 0
+
             # self._force_pub.publish(self._force)
+
+            self._msg_counter = self._msg_counter + 1
 
 
 def main():
@@ -220,45 +233,79 @@ def main():
     rospy.init_node('geomagic_mtm_proxy_node')
 
     _geomagic_one_name = '/Geomagic/'
-    _geomagic_two_name = '/Geomagic/'
+    _geomagic_two_name = ''
 
     _device_pairs = []
 
     _mtm_one_name = 'MTMR'
     _mtm_two_name = 'MTML'
 
+    # The publish frequency
+    _pub_freq = 500
+
+    print('Specified Arguments')
+    for i in range(0, len(sys.argv)):
+        print (sys.argv[i])
+
     if len(sys.argv) > 1:
         _geomagic_one_name = sys.argv[1]
+        _pair_one_specified = True
 
     if len(sys.argv) > 2:
-        _mtm_one_name = sys.argv[2]
-        _geomagic_two_name = True
+        _geomagic_two_name = sys.argv[2]
+        _pair_two_specified = True
+
+    if len(sys.argv) > 3:
+        _pub_freq = int(sys.argv[3])
 
     if _pair_one_specified:
         geomagic_one = GeomagicDevice(_geomagic_one_name, _mtm_one_name)
         base_frame = Frame()
-        base_frame.M = Rotation.RPY(-1.57079 - 0.6, 3.14, 0)
-        geomagic_one.set_base_frame(base_frame)
         tip_frame = Frame()
+        # This is important. Firs we set the orientation of the
+        # MTM base in Geomagic Base
+        base_frame.M = Rotation.RPY((-1.57079 - 0.6), 3.14, 0)
+        # Then we set the offset of MTMs tip in Geomagics Base
+        # The Geomagic Base and Tip are aligned
         tip_frame.M = Rotation.RPY(-3.14, 0, 1.57079)
+
+        geomagic_one.set_base_frame(base_frame)
         geomagic_one.set_tip_frame(tip_frame)
+
         _device_pairs.append(geomagic_one)
 
     if _pair_two_specified:
         geomagic_two = GeomagicDevice(_geomagic_two_name, _mtm_two_name)
+
+        base_frame = Frame()
+        tip_frame = Frame()
+        # This is important. Firs we set the orientation of the
+        # MTM base in Geomagic Base
+        base_frame.M = Rotation.RPY((-1.57079 - 0.6), 3.14, 0)
+        # Then we set the offset of MTMs tip in Geomagics Base
+        # The Geomagic Base and Tip are aligned
+        tip_frame.M = Rotation.RPY(-3.14, 0, 1.57079)
+
+        geomagic_two.set_base_frame(base_frame)
+        geomagic_two.set_tip_frame(tip_frame)
+
         _device_pairs.append(geomagic_two)
 
-    rate = rospy.Rate(500)
+    rate = rospy.Rate(_pub_freq)
     msg_index = 0
+    _start_time = rospy.get_time()
 
     while not rospy.is_shutdown():
         for dev in _device_pairs:
             dev.process_commands()
+
         rate.sleep()
         msg_index = msg_index + 1
-        if msg_index % 500 == 0:
-            print('MTM MIMIC VIA GEOMAGIC ACTIVE...')
-        if msg_index >= 5000:
+        if msg_index % _pub_freq*3 == 0:
+            # Print every 3 seconds as a flag to show that this code is alive
+            print('Geomagic Mimic Node Alive...', round(rospy.get_time() - _start_time, 3), 'secs')
+        if msg_index >= _pub_freq * 10:
+            # After ten seconds, reset, no need to keep increasing this
             msg_index = 0
 
 
