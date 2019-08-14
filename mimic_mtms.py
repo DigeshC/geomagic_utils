@@ -1,9 +1,10 @@
 import rospy
 from std_msgs.msg import Empty
-from geometry_msgs.msg import PoseStamped, Pose
-from sensor_msgs.msg import Joy
+from geometry_msgs.msg import PoseStamped, Pose, WrenchStamped
+from sensor_msgs.msg import Joy, JointState
 from geomagic_control.msg import DeviceButtonEvent, DeviceFeedback
 from PyKDL import Frame, Vector, Rotation
+import sys
 
 
 # Utilities
@@ -39,31 +40,99 @@ def msg_pose_to_kdl_frame(msg_pose):
 class ProxyMTM:
     def __init__(self, arm_name):
         pose_str = '/dvrk/' + arm_name + '/position_cartesian_current'
+        wrench_str = '/dvrk/' + arm_name + '/set_wrench_body'
+        gripper_str = '/dvrk/' + arm_name + '/state_gripper_current'
+
+
+        self._mtm_arm_type = None
+
+        if arm_name == 'MTMR':
+            self._mtm_arm_type = 0
+        elif arm_name == 'MTML':
+            self._mtm_arm_type = 1
+        else:
+            print('WARNING, MTM ARM TYPE NOT UNDERSTOOD, SHOULD BE MTMR or MTML')
+        pass
 
         self.pose = Frame()
         self.pose.p(0, 0, 0)
         self.pose.M.Quaternion(0, 0, 0, 1)
         self.buttons = 0
 
+        self._commanded_force = Vector(0, 0, 0)
+
+        self._gripper_min_angle = -3.16
+        self._gripper_max_angle = 1.2
+        self._gripper_angle = JointState()
+
         self._pose_pub = rospy.Publisher(pose_str, PoseStamped)
+        self._gripper_pub = rospy.Publisher(gripper_str, JointState)
+
+        self._force_sub = rospy.Subscriber(wrench_str, WrenchStamped, self.force_cb, queue_size=10)
+
+        self._foot_pedal = ProxyButtons()
         pass
+
+    def force_cb(self, msg):
+        self._commanded_force[0] = msg.wrench.force.x
+        self._commanded_force[1] = msg.wrench.force.y
+        self._commanded_force[2] = msg.wrench.force.z
 
     def set_pose(self, pose):
         self.pose = pose
         msg = kdl_frame_to_msg_pose(self.pose)
         self._pose_pub.publish(msg)
 
+    def set_gripper_angle(self, angle):
+        if angle == 0:
+            self._gripper_angle.position[0] = self._gripper_min_angle
+        elif angle == 1:
+            self._gripper_angle.position[0] = self._gripper_max_angle
+
+        self._gripper_pub.publish(self._gripper_angle)
+
+    def get_commanded_force(self):
+        return self._commanded_force
+
+    def set_foot_pedal(self, btn):
+        if self._mtm_arm_type == 0:
+            self._foot_pedal.set_clutch_footpedals(btn)
+        elif self._mtm_arm_type == 1:
+            self._foot_pedal.set_cam_footpedals(btn)
+
 
 # Init one instance of MTM FootPedals
-class ProxyFootPedal:
+class ProxyButtons:
     def __init__(self):
         self.buttons = 0
         base_str = '/dvrk/footpedals/'
         clutch_str = base_str + 'clutch'
         cam_str = base_str + 'cam'
+
+        self._clutch = Joy()
+        self._clutch.buttons[0] = 0
+        self._cam = Joy()
+        self._cam.buttons[0] = 0
+
         self._clutch_pub = rospy.Publisher(clutch_str, Joy)
         self._cam_pub = rospy.Publisher(cam_str, Joy)
         pass
+
+    def set_clutch_footpedals(self, btn):
+        self._clutch.buttons[0] = btn
+        self._clutch_pub.publish(self._clutch)
+        pass
+
+    def set_cam_footpedals(self, btn):
+        self._cam.buttons[0] = btn
+        self._cam_pub.publish(self._cam)
+        pass
+
+    # Use this function and to set the value of both footpedals, Use afInputDevices
+    # mapping to map one device's clutch to camera, and one to clutch
+    def set_cam_clutch_footpedals(self, btn):
+        self.set_clutch_footpedals(btn)
+        self.set_cam_footpedals(btn)
 
 
 # Init everthing related to Geomagic
@@ -74,27 +143,84 @@ class GeomagicDevice:
         button_str = name + 'button'
         force_str = name + 'force_feedback'
 
+        self._active = False
+        self._scale = 0.001
         self.pose = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
         self.base_frame = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
         self.tip_frame = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
-        self.buttons = 0
+        self.grey_button_pressed = False
+        self.white_button_pressed = False
+        self._force = Vector(0, 0, 0)
 
         self._pose_sub = rospy.Subscriber(pose_str, PoseStamped, self.pose_cb, queue_size=10)
         self._button_sub = rospy.Subscriber(button_str, DeviceButtonEvent, self.buttons_cb, queue_size=10)
         self._force_pub = rospy.Publisher(force_str, DeviceFeedback)
 
         self._mtm_handle = ProxyMTM(mtm_name)
-        pass
 
     def pose_cb(self, msg):
-        self.pose = msg_pose_to_kdl_frame(msg.pose)
+
+        cur_frame = msg_pose_to_kdl_frame(msg.pose)
+        # Convert the position based on the scale
+        cur_frame.p = cur_frame.p * self._scale
+
+        self.pose = self.base_frame.Inverse() * cur_frame * self.tip_frame
+        # Mark active as soon as first message comes through
+        self._active = True
         pass
 
     def buttons_cb(self, msg):
+        self.grey_button_pressed = msg.grey_button
+        self.white_button_pressed = msg.white_button
+
+        self._mtm_handle.set_foot_pedal(self.grey_button_pressed)
+        self._mtm_handle.set_gripper_angle(self.white_button_pressed)
         pass
 
     def command_force(self, force):
         pass
 
+    def process_commands(self):
+        self._mtm_handle.set_pose(self.pose)
 
-rospy.init_node('geomagic_mtm_proxy_node')
+        self._force = self._mtm_handle.ge
+
+
+def main():
+    _pair_one_specified = False
+    _pair_two_specified = False
+    rospy.init_node('geomagic_mtm_proxy_node')
+
+    _geomagic_one_name = '/Geomagic/'
+    _geomagic_two_name = '/Geomagic/'
+
+    _mtm_one_name = 'MTMR'
+    _mtm_two_name = 'MTML'
+
+    if len(sys.argv) > 1:
+        _geomagic_one_name = sys.argv[1]
+
+    if len(sys.argv) > 2:
+        _mtm_one_name = sys.argv[2]
+        _pair_one_specified = True
+
+    if len(sys.argv) > 1:
+        _geomagic_two_name = sys.argv[3]
+
+    if len(sys.argv) > 1:
+        _mtm_two_name = sys.argv[4]
+        _pair_two_specified = True
+
+    else:
+        print("No ARMS specified")
+        exit()
+
+    if _pair_one_specified:
+        geomagic_one = GeomagicDevice(_geomagic_one_name, _mtm_one_name)
+
+    if _pair_two_specified:
+        geomagic_two = GeomagicDevice(_geomagic_two_name, _mtm_two_name)
+
+
+if __name__ == "__main__":
+    main()
