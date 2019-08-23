@@ -45,7 +45,7 @@
 
 import rospy
 from std_msgs.msg import Empty
-from geometry_msgs.msg import PoseStamped, Pose, WrenchStamped, Wrench
+from geometry_msgs.msg import PoseStamped, Pose, WrenchStamped, Wrench, Vector3
 from sensor_msgs.msg import Joy, JointState
 from geomagic_control.msg import DeviceFeedback, DeviceButtonEvent
 from PyKDL import Frame, Vector, Rotation
@@ -195,12 +195,12 @@ class GeomagicDevice:
         force_str = name + 'force_feedback'
 
         self._active = False
-        self._scale = 0.001
+        self._scale = 0.0009
         self.pose = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
         self.base_frame = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
         self.tip_frame = Frame(Rotation().RPY(0, 0, 0), Vector(0, 0, 0))
-        self.grey_button_pressed = False
-        self.white_button_pressed = False
+        self.grey_button_pressed = False # Used as Position Engage Clutch
+        self.white_button_pressed = False # Used as Gripper Open Close Binary Angle
         self._force = DeviceFeedback()
         self._force.force.x = 0
         self._force.force.y = 0
@@ -212,6 +212,14 @@ class GeomagicDevice:
         self._pose_sub = rospy.Subscriber(pose_str, PoseStamped, self.pose_cb, queue_size=10)
         self._button_sub = rospy.Subscriber(button_str, DeviceButtonEvent, self.buttons_cb, queue_size=10)
         self._force_pub = rospy.Publisher(force_str, DeviceFeedback, queue_size=1)
+
+        # External Clutch Buttons Requested by ICL
+        extra_footPedal_str = '/footPedal'
+        self._extra_pedal_cb = rospy.Subscriber(extra_footPedal_str, Vector3, self.extra_footpedal_cb, queue_size=1)
+        self._engageMTM = True
+        self._externalFootPedalMsg = Vector3()
+
+        self._geomagicButtonMsg = DeviceButtonEvent()
 
         print('BINDING GEOMAGIC DEVICE: ', name, 'TO MOCK MTM DEVICE: ', mtm_name)
         self._mtm_handle = ProxyMTM(mtm_name)
@@ -241,18 +249,37 @@ class GeomagicDevice:
         pass
 
     def buttons_cb(self, msg):
-        self.grey_button_pressed = msg.grey_button
         self.white_button_pressed = msg.white_button
-        pass
+
+        self._geomagicButtonMsg = msg
+        # If any of the two pos clutch buttons are pressed. enable clutch
+        if self._geomagicButtonMsg.grey_button or self._externalFootPedalMsg.y == 1:
+            self.grey_button_pressed = True
+        else:
+            self.grey_button_pressed = False
+
+    def extra_footpedal_cb(self, msg):
+        if msg.x == 1.0:
+            self._engageMTM = True
+        elif msg.x == 0.0:
+            self._engageMTM = False
+
+        self._externalFootPedalMsg = msg
+        # If any of the two pos clutch buttons are pressed. enable clutch
+        if self._externalFootPedalMsg.y == 1 or self._geomagicButtonMsg.grey_button:
+            self.grey_button_pressed = True
+        else:
+            self.grey_button_pressed = False
 
     def command_force(self, force):
         pass
 
     def process_commands(self):
         if self._active:
-            self._mtm_handle.set_pose(self.pose)
-            self._mtm_handle.set_gripper_angle(self.white_button_pressed)
-            self._mtm_handle.set_foot_pedal(self.grey_button_pressed)
+            if self._engageMTM:
+                self._mtm_handle.set_pose(self.pose)
+                self._mtm_handle.set_gripper_angle(self.white_button_pressed)
+                self._mtm_handle.set_foot_pedal(self.grey_button_pressed)
             self._mtm_handle.publish_status()
 
             force = self._mtm_handle.get_commanded_force()
